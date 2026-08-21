@@ -1,0 +1,18 @@
+{
+  "name": "discord-verify-bot",
+  "version": "1.0.0",
+  "description": "Discord verification bot - button click swaps Unverified role for Verified role",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js",
+    "deploy-commands": "node deploy-commands.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.14.1",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
