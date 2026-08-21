@@ -39,7 +39,7 @@ client.on('guildMemberAdd', async (member) => {
       const channel = await member.guild.channels.fetch(WELCOME_CHANNEL_ID);
       if (channel) {
         await channel.send(
-          `👋 Welcome to **Texas State Roleplay** ${member}, we are excited to see you here! You are member #${member.guild.memberCount}. Please read our regulations and make sure to follow them at all times!`
+          `👋 Welcome to **Texas State Roleplay** ${member}, we are excited to see you here! You are member #${member.guild.memberCount}. Please remember to read our rules and regulations!`
         );
       }
     }
