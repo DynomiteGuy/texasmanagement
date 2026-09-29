@@ -23,6 +23,14 @@ async function init() {
       adjustment_seconds INTEGER NOT NULL DEFAULT 0
     );
   `);
+  // Shift-period ("wave") reset settings, added per guild
+  await pool.query(`ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS reset_mode TEXT;`);
+  await pool.query(`ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS reset_weekday INTEGER;`);
+  await pool.query(`ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS reset_interval_days INTEGER;`);
+  await pool.query(`ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS current_period_start TIMESTAMPTZ;`);
+  await pool.query(
+    `ALTER TABLE shifts ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();`
+  );
 }
 
 async function getActiveShift(guildId, userId) {
@@ -56,30 +64,42 @@ async function adjustShift(guildId, userId, seconds) {
   ]);
 }
 
-async function getTotalSeconds(guildId, userId) {
+async function getTotalSeconds(guildId, userId, periodStart = null) {
+  const params = [guildId, userId];
+  let periodClause = '';
+  if (periodStart) {
+    params.push(periodStart);
+    periodClause = ` AND created_at >= $3`;
+  }
   const { rows } = await pool.query(
     `SELECT
        COALESCE(SUM(EXTRACT(EPOCH FROM (end_time - start_time))), 0) AS session_seconds,
        COALESCE(SUM(adjustment_seconds), 0) AS adjustment_seconds
      FROM shifts
-     WHERE guild_id=$1 AND user_id=$2 AND (end_time IS NOT NULL OR adjustment_seconds != 0)`,
-    [guildId, userId]
+     WHERE guild_id=$1 AND user_id=$2 AND (end_time IS NOT NULL OR adjustment_seconds != 0)${periodClause}`,
+    params
   );
   const row = rows[0];
   return Math.round(Number(row.session_seconds) + Number(row.adjustment_seconds));
 }
 
-async function getLeaderboard(guildId, limit = 10) {
+async function getLeaderboard(guildId, limit = 10, periodStart = null) {
+  const params = [guildId, limit];
+  let periodClause = '';
+  if (periodStart) {
+    params.push(periodStart);
+    periodClause = ` AND created_at >= $3`;
+  }
   const { rows } = await pool.query(
     `SELECT user_id,
        COALESCE(SUM(EXTRACT(EPOCH FROM (end_time - start_time))), 0) +
        COALESCE(SUM(adjustment_seconds), 0) AS total_seconds
      FROM shifts
-     WHERE guild_id=$1
+     WHERE guild_id=$1${periodClause}
      GROUP BY user_id
      ORDER BY total_seconds DESC
      LIMIT $2`,
-    [guildId, limit]
+    params
   );
   return rows.map((r) => ({ userId: r.user_id, totalSeconds: Math.round(Number(r.total_seconds)) }));
 }
@@ -106,6 +126,36 @@ async function upsertGuildConfig(guildId, fields) {
   }
 }
 
+async function setShiftReset(guildId, mode, { weekday = null, intervalDays = null } = {}) {
+  await upsertGuildConfig(guildId, {
+    reset_mode: mode,
+    reset_weekday: weekday,
+    reset_interval_days: intervalDays,
+    current_period_start: new Date().toISOString(),
+  });
+}
+
+async function clearShiftReset(guildId) {
+  await upsertGuildConfig(guildId, {
+    reset_mode: null,
+    reset_weekday: null,
+    reset_interval_days: null,
+    current_period_start: null,
+  });
+}
+
+async function getGuildsWithResetSchedule() {
+  const { rows } = await pool.query(
+    `SELECT guild_id, reset_mode, reset_weekday, reset_interval_days, current_period_start
+     FROM guild_config WHERE reset_mode IS NOT NULL`
+  );
+  return rows;
+}
+
+async function setPeriodStart(guildId, newStart) {
+  await pool.query(`UPDATE guild_config SET current_period_start=$2 WHERE guild_id=$1`, [guildId, newStart]);
+}
+
 module.exports = {
   init,
   getActiveShift,
@@ -116,4 +166,8 @@ module.exports = {
   getLeaderboard,
   getGuildConfig,
   upsertGuildConfig,
+  setShiftReset,
+  clearShiftReset,
+  getGuildsWithResetSchedule,
+  setPeriodStart,
 };

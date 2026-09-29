@@ -14,9 +14,14 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
 });
 
+const DAY_MS = 86400000;
+const DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+
 client.once('ready', async () => {
   await db.init();
   console.log(`Logged in as ${client.user.tag}`);
+  checkShiftResets();
+  setInterval(checkShiftResets, 60 * 60 * 1000); // check hourly
 });
 
 // Sums every (\d+)(s|m|h|d|w) chunk in a string into total seconds, e.g. "1h30m" -> 5400
@@ -47,9 +52,56 @@ function hasHrPermission(interaction, guildConfig) {
   return false;
 }
 
+// Finds the next date/time (UTC midnight) matching `weekday` that is strictly after `fromDate`
+function nextWeekdayAfter(fromDate, weekday) {
+  const d = new Date(fromDate);
+  d.setUTCHours(0, 0, 0, 0);
+  let diff = (weekday - d.getUTCDay() + 7) % 7;
+  if (diff === 0) diff = 7;
+  d.setUTCDate(d.getUTCDate() + diff);
+  return d;
+}
+
+async function checkShiftResets() {
+  try {
+    const guilds = await db.getGuildsWithResetSchedule();
+    const now = new Date();
+    for (const g of guilds) {
+      let periodStart = new Date(g.current_period_start);
+      let changed = false;
+
+      if (g.reset_mode === 'weekday') {
+        let nextReset = nextWeekdayAfter(periodStart, g.reset_weekday);
+        while (now >= nextReset) {
+          periodStart = nextReset;
+          nextReset = nextWeekdayAfter(periodStart, g.reset_weekday);
+          changed = true;
+        }
+      } else if (g.reset_mode === 'interval' && g.reset_interval_days) {
+        let nextReset = new Date(periodStart.getTime() + g.reset_interval_days * DAY_MS);
+        while (now >= nextReset) {
+          periodStart = nextReset;
+          nextReset = new Date(periodStart.getTime() + g.reset_interval_days * DAY_MS);
+          changed = true;
+        }
+      }
+
+      if (changed) {
+        await db.setPeriodStart(g.guild_id, periodStart.toISOString());
+        console.log(`Shift period reset for guild ${g.guild_id}`);
+      }
+    }
+  } catch (err) {
+    console.error('Error checking shift resets:', err);
+  }
+}
+
 async function buildShiftPayload(guildId, userId) {
+  const guildConfig = await db.getGuildConfig(guildId);
+  const periodStart = guildConfig?.current_period_start || null;
+
   const active = await db.getActiveShift(guildId, userId);
-  const total = await db.getTotalSeconds(guildId, userId);
+  const total = await db.getTotalSeconds(guildId, userId, periodStart);
   const currentSeconds = active
     ? Math.floor((Date.now() - new Date(active.start_time).getTime()) / 1000)
     : 0;
@@ -60,8 +112,18 @@ async function buildShiftPayload(guildId, userId) {
     .addFields(
       { name: 'Status', value: active ? '🟢 On duty' : '⚪ Off duty', inline: true },
       { name: 'Current Shift', value: active ? formatSeconds(currentSeconds) : '—', inline: true },
-      { name: 'Total Shift Time', value: formatSeconds(total + currentSeconds), inline: true }
+      {
+        name: periodStart ? 'This Period' : 'Total Shift Time',
+        value: formatSeconds(total + currentSeconds),
+        inline: true,
+      }
     );
+
+  if (periodStart) {
+    embed.setFooter({
+      text: `Period started ${new Date(periodStart).toDateString()}`,
+    });
+  }
 
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
@@ -89,7 +151,9 @@ client.on('interactionCreate', async (interaction) => {
 
     // /shift-leaderboard
     if (interaction.isChatInputCommand() && interaction.commandName === 'shift-leaderboard') {
-      const rows = await db.getLeaderboard(interaction.guild.id, 10);
+      const guildConfig = await db.getGuildConfig(interaction.guild.id);
+      const periodStart = guildConfig?.current_period_start || null;
+      const rows = await db.getLeaderboard(interaction.guild.id, 10, periodStart);
       if (rows.length === 0) {
         return interaction.reply({ content: 'No shift data logged yet.', ephemeral: true });
       }
@@ -98,6 +162,9 @@ client.on('interactionCreate', async (interaction) => {
         .setTitle('🏆 Shift Leaderboard')
         .setDescription(lines.join('\n'))
         .setColor(0xfee75c);
+      if (periodStart) {
+        embed.setFooter({ text: `Since ${new Date(periodStart).toDateString()}` });
+      }
       return interaction.reply({ embeds: [embed] });
     }
 
@@ -124,7 +191,11 @@ client.on('interactionCreate', async (interaction) => {
       const signedSeconds = action === 'subtract' ? -seconds : seconds;
       await db.adjustShift(interaction.guild.id, target.id, signedSeconds);
 
-      const newTotal = await db.getTotalSeconds(interaction.guild.id, target.id);
+      const newTotal = await db.getTotalSeconds(
+        interaction.guild.id,
+        target.id,
+        guildConfig?.current_period_start || null
+      );
       return interaction.reply({
         content: `${action === 'subtract' ? 'Removed' : 'Added'} ${formatSeconds(seconds)} ${
           action === 'subtract' ? 'from' : 'to'
@@ -165,7 +236,35 @@ client.on('interactionCreate', async (interaction) => {
         return interaction.reply({ content: "You don't have permission to do that.", ephemeral: true });
       }
 
+      const group = interaction.options.getSubcommandGroup(false);
       const sub = interaction.options.getSubcommand();
+
+      if (group === 'shift-reset') {
+        if (sub === 'weekday') {
+          const day = parseInt(interaction.options.getString('day'), 10);
+          await db.setShiftReset(interaction.guild.id, 'weekday', { weekday: day });
+          return interaction.reply({
+            content: `Shift totals and the leaderboard will now reset every ${DAY_NAMES[day]}. Current period starts now.`,
+            ephemeral: true,
+          });
+        }
+        if (sub === 'interval') {
+          const days = interaction.options.getInteger('days');
+          await db.setShiftReset(interaction.guild.id, 'interval', { intervalDays: days });
+          return interaction.reply({
+            content: `Shift totals will now reset every ${days} day(s) ("wave" length). Current wave starts now.`,
+            ephemeral: true,
+          });
+        }
+        if (sub === 'off') {
+          await db.clearShiftReset(interaction.guild.id);
+          return interaction.reply({
+            content: 'Automatic shift resets turned off — totals now track all-time again.',
+            ephemeral: true,
+          });
+        }
+        return;
+      }
 
       if (sub === 'hr-role') {
         const role = interaction.options.getRole('role');
